@@ -26,16 +26,19 @@ internal static class AssemblyScope
             .ToList();
     }
 
-    public static List<string> GetAssemblyFiles(string path, bool includeBuildArtifacts, bool excludeBinWhenSourceFilesPresent, Action<string>? diagnostics = null)
+    public static List<string> GetAssemblyFiles(string path, bool includeBuildArtifacts, bool excludeBinWhenSourceFilesPresent, Action<string>? diagnostics = null) =>
+        SplitAssemblyFiles(path, includeBuildArtifacts, excludeBinWhenSourceFilesPresent, diagnostics).Files;
+
+    public static (List<string> Files, List<string> ExcludedBin) SplitAssemblyFiles(string path, bool includeBuildArtifacts, bool excludeBinWhenSourceFilesPresent, Action<string>? diagnostics = null)
     {
         if (!File.Exists(path) && !Directory.Exists(path))
         {
-            return [];
+            return ([], []);
         }
 
         if (!File.GetAttributes(path).HasFlag(FileAttributes.Directory))
         {
-            return IsAssemblyExtension(Path.GetExtension(path)) ? [path] : [];
+            return (IsAssemblyExtension(Path.GetExtension(path)) ? [path] : [], []);
         }
 
         var applicationAssemblyNames = GetApplicationAssemblyNames(path, diagnostics);
@@ -66,14 +69,28 @@ internal static class AssemblyScope
             candidates.Add(file);
         }
 
-        return candidates
-            .Where(file => includeBuildArtifacts || !excludeBinWhenSourceFilesPresent || !hasSourceFiles || !HasDirectorySegment(Path.GetRelativePath(path, file), BinSegment))
+        var applicationFiles = candidates
             .Where(file => applicationAssemblyNames.Count == 0
                 ? IsLikelyApplicationAssembly(Path.GetFileName(file))
                 : applicationAssemblyNames.Contains(Path.GetFileNameWithoutExtension(file)))
             .ToDictionary(file => Path.GetFullPath(file), file => file, StringComparer.OrdinalIgnoreCase)
-            .Values
-            .ToList();
+            .Values;
+        var excludesBin = !includeBuildArtifacts && excludeBinWhenSourceFilesPresent && hasSourceFiles;
+        var files = new List<string>();
+        var excludedBin = new List<string>();
+        foreach (var file in applicationFiles)
+        {
+            if (excludesBin && HasDirectorySegment(Path.GetRelativePath(path, file), BinSegment))
+            {
+                excludedBin.Add(file);
+            }
+            else
+            {
+                files.Add(file);
+            }
+        }
+
+        return (files, excludedBin);
     }
 
     public static HashSet<string> GetApplicationAssemblyNames(string directory, Action<string>? diagnostics = null)
