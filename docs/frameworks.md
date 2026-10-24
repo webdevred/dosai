@@ -174,6 +174,13 @@ and `McpToolInjectionCandidate` (CWE-1427).
 - Route templates that cannot be resolved (non-constant expressions) keep the verbatim template
   in `Route` and leave `Path` null at low confidence, never a garbled path.
 - Razor/Blazor parsing is textual by design (the templates are not C# compilations).
+- Calls inside `.razor` and `.cshtml` files come from the build: `methods` reads them from the
+  assemblies under `bin/` that the tree builds from source and whose PDB names such a file, so
+  a tree that has not been built lists none of them. A call's line is the PDB's, so it is only as
+  exact as the Razor compiler's line mapping: in builds from the .NET SDKs 10.0.402 and
+  11.0.100-rc.2 a call in a plain HTML attribute value or a component parameter takes the line of
+  the code before it, and in builds from 8.0.426 so do most expressions in markup, or one is not
+  listed when no mapped code comes before it (dotnet/razor#11432, dotnet/razor#13056).
 
 ## CLI
 

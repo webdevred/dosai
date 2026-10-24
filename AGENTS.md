@@ -152,6 +152,13 @@ dotnet test ./Dosai.sln
   arrays). Resolve members through `AssemblyScan.Resolve` (memoized per token, so call sites
   share one id string) and source locations through the per-assembly source map (binary search,
   one path and file-name string per document) - never per instruction.
+- The call graph leaves a source tree's `bin/` to the source analysis, except the tree's own
+  builds whose PDB names a `.razor` or `.cshtml` file: no source file holds a template, so those
+  assemblies give only the call sites in such files (`CallSites.InRazorFiles`), and their
+  fragment keeps only the nodes those sites name. A copy group with any member outside `bin/` is
+  read whole whichever copy is analyzed, so a build copied to `out/` keeps the rows of issue #79.
+  Reading `bin/` whole lists most source call sites a second time from IL and nearly quadrupled
+  `MethodCalls` on the `Dosai` tree.
 - An async or iterator method's IL is a stub with no sequence points; both PDB source maps
   (`DataFlowAssembly`, `AssemblyCallGraphAnalyzer`) resolve it to its `MoveNext`'s first point
   through `MethodDebugInformation.GetStateMachineKickoffMethod` (issue #84). Never fall back to

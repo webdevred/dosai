@@ -27,14 +27,20 @@ internal static class AssemblyCallGraphAnalyzer
         // A built tree holds a copy of each referenced assembly in every referencing project's
         // output, and each copy gave every call in it once more (issue #83, the same pass
         // shape as the data-flow one): each distinct file is analyzed once.
-        var copies = AssemblyCopies.Collapse(path, GetAssemblyFiles(path));
+        var (wholeAssemblies, razorBuilds) = GetAssemblyFiles(path);
+        var copies = AssemblyCopies.Collapse(path, [.. wholeAssemblies, .. razorBuilds]);
         if (copies.Diagnostic(path, "each call in them is reported once") is { } copiesDiagnostic)
         {
             diagnostics.Add(copiesDiagnostic);
         }
 
         var assemblyPaths = copies.Distinct;
-        var context = new AnalysisContext(path, knownMethods, copies.AnalyzedByFullPath());
+        var analyzedByFullPath = copies.AnalyzedByFullPath();
+        var context = new AnalysisContext(path, knownMethods, analyzedByFullPath);
+        var readWhole = wholeAssemblies
+            .Select(Path.GetFullPath)
+            .Select(file => analyzedByFullPath.GetValueOrDefault(file, file))
+            .ToHashSet(SafeFileRead.PathComparer);
         var calls = new List<MethodCalls>();
         var nodes = new Dictionary<string, MethodNode>(StringComparer.Ordinal);
         var edges = new List<MethodCallEdge>();
@@ -51,7 +57,7 @@ internal static class AssemblyCallGraphAnalyzer
         // cross-assembly call-site de-duplication come out exactly as the sequential loop
         // produced them, for every worker count.
         DedicatedStack.ForEachInOrder("Dosai assembly call graph", Math.Max(1, Dosai.MaxSymbolAnalysisWorkers), assemblyPaths.Count,
-            index => AnalyzeAssembly(assemblyPaths[index], context),
+            index => AnalyzeAssembly(assemblyPaths[index], context, readWhole.Contains(Path.GetFullPath(assemblyPaths[index])) ? CallSites.All : CallSites.InRazorFiles),
             fragment => fragment.MergeInto(calls, nodes, edges, edgeKeys));
 
         GraphAssembly.SortEdgesInPlace(edges);
@@ -66,7 +72,7 @@ internal static class AssemblyCallGraphAnalyzer
     ///     fragment and per-assembly caches, and reads the shared context. A failure keeps what
     ///     the assembly produced before it, as the sequential loop did.
     /// </summary>
-    private static AssemblyFragment AnalyzeAssembly(string assemblyPath, AnalysisContext context)
+    private static AssemblyFragment AnalyzeAssembly(string assemblyPath, AnalysisContext context, CallSites callSites)
     {
         // Only managed assemblies reach here: the copy collapse drops every other file.
         var fragment = new AssemblyFragment();
@@ -89,6 +95,11 @@ internal static class AssemblyCallGraphAnalyzer
         catch
         {
             // Methods already best-effort skips unloadable assemblies; keep call graph extraction equally non-fatal.
+        }
+
+        if (callSites == CallSites.InRazorFiles)
+        {
+            fragment.KeepCallSites(call => IsRazorFile(call.FileName));
         }
 
         fragment.CompleteAnalysis();
@@ -1153,9 +1164,44 @@ internal static class AssemblyCallGraphAnalyzer
         }
     }
 
-    private static List<string> GetAssemblyFiles(string path)
+    /// <summary>
+    ///     The source analysis reads no <c>.razor</c> or <c>.cshtml</c> template: its calls exist only in
+    ///     the tree's own builds under <c>bin/</c>.
+    /// </summary>
+    private static (List<string> Whole, List<string> RazorBuilds) GetAssemblyFiles(string path)
     {
-        return AssemblyScope.GetAssemblyFiles(path, includeBuildArtifacts: false, excludeBinWhenSourceFilesPresent: true);
+        var (files, excludedBin) = AssemblyScope.SplitAssemblyFiles(path, includeBuildArtifacts: false, excludeBinWhenSourceFilesPresent: true);
+        List<string> razorBuilds = SourceDocumentPaths.Root(path) is { } root
+            ? excludedBin.Where(file => TreeFrameworks.IsBuiltFromSource(root, file) && PdbNamesARazorFile(file)).ToList()
+            : [];
+        return (files, razorBuilds);
+    }
+
+    private static bool PdbNamesARazorFile(string assemblyPath)
+    {
+        var pdbPath = Path.ChangeExtension(assemblyPath, ".pdb");
+        if (!File.Exists(pdbPath)) return false;
+        try
+        {
+            using var pdbStream = new FileStream(pdbPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var provider = MetadataReaderProvider.FromPortablePdbStream(pdbStream);
+            var reader = provider.GetMetadataReader();
+            return reader.Documents.Any(document => IsRazorFile(reader.GetString(reader.GetDocument(document).Name)));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsRazorFile(string? path) =>
+        Path.GetExtension(path) is { } extension
+        && (extension.Equals(".razor", StringComparison.OrdinalIgnoreCase) || extension.Equals(".cshtml", StringComparison.OrdinalIgnoreCase));
+
+    private enum CallSites
+    {
+        All,
+        InRazorFiles
     }
 
     private sealed record AssemblyCallInstruction(int Offset, OpCode OpCode, object? Operand);
@@ -1395,6 +1441,28 @@ internal static class AssemblyCallGraphAnalyzer
             _emissions.Add(new Emission(call, edge, key, hash, callNeedsNewSite));
 
         public void CompleteAnalysis() => Keys = null!;
+
+        /// <summary>Drops the call sites <paramref name="keep" /> rejects, and the nodes no call site left names.</summary>
+        public void KeepCallSites(Predicate<MethodCalls> keep)
+        {
+            _emissions.RemoveAll(emission => !keep(emission.Call));
+            var named = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var emission in _emissions)
+            {
+                named.Add(emission.Call.SourceId!);
+                named.Add(emission.Call.TargetId!);
+                if (emission.Edge is { } edge)
+                {
+                    named.Add(edge.SourceId);
+                    named.Add(edge.TargetId);
+                }
+            }
+
+            foreach (var id in Nodes.Keys.Where(id => !named.Contains(id)).ToList())
+            {
+                Nodes.Remove(id);
+            }
+        }
 
         public void MergeInto(List<MethodCalls> calls, Dictionary<string, MethodNode> nodes, List<MethodCallEdge> edges, GraphAssembly.EdgeSiteIndex edgeKeys)
         {
